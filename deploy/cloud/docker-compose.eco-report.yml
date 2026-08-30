@@ -1,0 +1,66 @@
+name: eco-report
+
+services:
+  eco-report-smoke-api:
+    image: python@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a
+    pull_policy: never
+    working_dir: /opt/eco-report-agent
+    command:
+      - python
+      - -m
+      - eco_report_agent.cli
+      - serve
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: /opt/eco-report-agent/src
+      ECO_REPORT_WORKBOOK_PATH: /opt/eco-report-agent/fixtures/cloud-smoke.xlsx
+      ECO_REPORT_SERVICE_TOKEN: ${ECO_REPORT_SERVICE_TOKEN:?required}
+      ECO_REPORT_ENABLE_PDF_RENDERER: "0"
+    volumes:
+      - type: bind
+        source: ${ECO_REPORT_RELEASE_DIR:?required}
+        target: /opt/eco-report-agent
+        read_only: true
+    networks:
+      default:
+        aliases:
+          - eco-report-smoke-api
+    expose:
+      - "8000"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 10s
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  default:
+    name: docker_default
+    external: true

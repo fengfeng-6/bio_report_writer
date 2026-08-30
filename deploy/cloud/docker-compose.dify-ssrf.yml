@@ -1,0 +1,4 @@
+services:
+  ssrf_proxy:
+    environment:
+      SSRF_PROXY_ALLOW_PRIVATE_DOMAINS: eco-report-smoke-api

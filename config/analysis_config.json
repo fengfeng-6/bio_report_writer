@@ -1,0 +1,27 @@
+{
+  "config_version": "2.1-mvp",
+  "indicator_dimensions": {
+    "MEAN_NDVI": "vegetation_condition",
+    "MEAN_NPP": "vegetation_productivity",
+    "MEAN_VCI": "vegetation_condition",
+    "MEAN_EVI": "vegetation_condition",
+    "MEAN_SIF": "vegetation_productivity",
+    "MEAN_VCS_C": "carbon_sequestration",
+    "MEAN_VCS_CO2e": "carbon_sequestration",
+    "CA": "landscape_composition",
+    "LPI": "landscape_structure",
+    "NP": "landscape_structure",
+    "PD": "landscape_structure",
+    "ED": "landscape_structure",
+    "LSI": "landscape_structure",
+    "ERI": "integrated_ecological_risk"
+  },
+  "dimension_labels": {
+    "vegetation_condition": "植被状态",
+    "vegetation_productivity": "植被生产力",
+    "carbon_sequestration": "生态系统固碳能力",
+    "landscape_composition": "景观组成",
+    "landscape_structure": "景观空间结构",
+    "integrated_ecological_risk": "综合生态风险"
+  }
+}

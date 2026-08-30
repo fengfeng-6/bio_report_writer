@@ -1,0 +1,9 @@
+.git
+private_inputs
+outputs
+artifacts
+vendor
+tests
+slurm-*.out
+__pycache__
+*.pyc

@@ -1,0 +1,13 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%files
+    src /app/src
+
+%environment
+    export PYTHONDONTWRITEBYTECODE=1
+    export PYTHONUNBUFFERED=1
+    export PYTHONPATH=/app/src
+
+%runscript
+    exec python -m eco_report_agent.cli "$@"

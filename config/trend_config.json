@@ -1,0 +1,8 @@
+{
+  "minimum_valid_years": 3,
+  "epsilon": 1e-12,
+  "long_term_relative_change_threshold": 0.10,
+  "stable_relative_range_threshold": 0.10,
+  "recent_relative_change_threshold": 0.03,
+  "minimum_segment_points": 2
+}
