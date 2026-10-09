@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -30,6 +31,11 @@ def parse_report_markdown(markdown: str) -> list[DocumentBlock]:
         if line == "<!-- pagebreak -->":
             blocks.append(DocumentBlock(kind="pagebreak"))
             index += 1
+            continue
+        if line == "<!-- toc -->":
+            blocks.append(DocumentBlock(kind="toc"))
+            index += 1
+            continue
         if not line:
             index += 1
             continue
@@ -51,6 +57,10 @@ def parse_report_markdown(markdown: str) -> list[DocumentBlock]:
         if line.startswith("![") and "](" in line and line.endswith(")"):
             separator = line.index("](")
             blocks.append(DocumentBlock(kind="image", text=line[2:separator], source=line[separator + 2:-1]))
+            index += 1
+            continue
+        if re.fullmatch(r"\*\*(?:表|图)\s+.+\*\*", line):
+            blocks.append(DocumentBlock(kind="caption", text=line[2:-2].strip()))
             index += 1
             continue
         if line.startswith("#"):

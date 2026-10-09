@@ -11,6 +11,14 @@ from .models import ReportIR
 from .report_validation import validate_report_markdown
 
 
+TABLE_COLUMN_WEIGHTS = {
+    "问题ID": 0.75, "事实ID": 0.90, "措施ID": 0.70, "问题": 1.35, "措施": 1.20,
+    "状态": 1.10, "严重程度": 0.85, "问题趋势": 1.05, "趋势": 1.05, "可信度": 0.85,
+    "对应问题": 1.35, "作用机制": 1.35, "来源": 0.85,
+    "限制说明": 1.80, "证据ID": 1.25, "指标": 1.10,
+}
+
+
 def _latex_escape(text: str) -> str:
     replacements = {
         "\\": r"\textbackslash{}",
@@ -20,7 +28,7 @@ def _latex_escape(text: str) -> str:
         "$": r"\$",
         "%": r"\%",
         "&": r"\&",
-        "_": r"\_",
+        "_": r"\_\allowbreak{}",
         "~": r"\textasciitilde{}",
         "^": r"\textasciicircum{}",
         "—": "-",
@@ -30,29 +38,39 @@ def _latex_escape(text: str) -> str:
     return "".join(replacements.get(character, character) for character in text)
 
 
+def _table_widths(headers: tuple[str, ...]) -> list[float]:
+    weights = [TABLE_COLUMN_WEIGHTS.get(header, 1.0) for header in headers]
+    total = sum(weights)
+    return [0.86 * weight / total for weight in weights]
+
+
 def _table_latex(block: DocumentBlock) -> list[str]:
-    column_count = max(1, len(block.rows[0]))
-    width = max(0.12, 0.92 / column_count)
-    column = rf">{{\raggedright\arraybackslash}}p{{{width:.3f}\textwidth}}"
-    specification = "|" + "|".join(column for _ in range(column_count)) + "|"
-    lines = [rf"\begin{{longtable}}{{{specification}}}", r"\hline"]
-    for row_index, row in enumerate(block.rows):
-        values = " & ".join(_latex_escape(value) for value in row)
-        if row_index == 0:
-            header_values = "} & \\textbf{".join(_latex_escape(value) for value in row)
-            lines.extend(
-                [
-                    rf"\rowcolor{{ReportTable}}\textbf{{{header_values}}} \\",
-                    r"\hline",
-                    r"\endfirsthead",
-                    rf"\rowcolor{{ReportTable}}\textbf{{{header_values}}} \\",
-                    r"\hline",
-                    r"\endhead",
-                ]
-            )
-        else:
-            lines.extend([values + r" \\", r"\hline"])
-    lines.append(r"\end{longtable}")
+    widths = _table_widths(block.rows[0])
+    columns = [rf">{{\raggedright\arraybackslash}}p{{{width:.3f}\textwidth}}" for width in widths]
+    specification = "".join(columns)
+    header_values = "} & \\textbf{".join(_latex_escape(value) for value in block.rows[0])
+    header = rf"\textbf{{{header_values}}} \\"
+    lines = [
+        r"{\fontsize{9}{11}\selectfont",
+        r"\setlength{\tabcolsep}{3pt}",
+        r"\renewcommand{\arraystretch}{1.12}",
+        r"\sloppy",
+        rf"\begin{{longtable}}{{{specification}}}",
+        r"\toprule",
+        header,
+        r"\midrule",
+        r"\endfirsthead",
+        r"\toprule",
+        header,
+        r"\midrule",
+        r"\endhead",
+        r"\bottomrule",
+        r"\endfoot",
+    ]
+    for row in block.rows[1:]:
+        values = " & ".join(r"\hspace{0pt}" + _latex_escape(value) for value in row)
+        lines.append(values + r" \\")
+    lines.extend([r"\end{longtable}", r"}"])
     return lines
 
 
@@ -60,12 +78,18 @@ def render_latex_report(markdown: str, project_name: str, target_year: int) -> s
     blocks = parse_report_markdown(markdown)
     body: list[str] = []
     in_list = False
+    on_cover = True
     for block in blocks:
         if block.kind != "bullet" and in_list:
             body.append(r"\end{itemize}")
             in_list = False
         if block.kind == "pagebreak":
             body.append(r"\newpage")
+            on_cover = False
+        elif block.kind == "toc":
+            body.extend([r"\setcounter{tocdepth}{2}", r"\tableofcontents"])
+        elif block.kind == "caption":
+            body.append(r"\begin{center}\fontsize{10.5}{13}\selectfont\bfseries " + _latex_escape(block.text) + r"\end{center}")
         elif block.kind == "bullet":
             if not in_list:
                 body.append(r"\begin{itemize}")
@@ -91,13 +115,20 @@ def render_latex_report(markdown: str, project_name: str, target_year: int) -> s
                 command = {2: "section", 3: "subsection", 4: "subsubsection"}.get(block.level, "paragraph")
                 body.append(r"\Needspace{6\baselineskip}")
                 body.append(rf"\{command}*{{{escaped}}}")
+                if block.text != "目录":
+                    body.append(rf"\addcontentsline{{toc}}{{{command}}}{{{escaped}}}")
         elif block.kind == "table":
             body.extend(_table_latex(block))
         else:
-            body.append(_latex_escape(block.text) + r"\par")
+            if on_cover:
+                body.append(r"\begin{center}" + _latex_escape(block.text) + r"\end{center}")
+            elif block.text.startswith("**关键词：**"):
+                body.append(r"\textbf{关键词：}" + _latex_escape(block.text.removeprefix("**关键词：**")) + r"\par")
+            else:
+                body.append(_latex_escape(block.text) + r"\par")
     if in_list:
         body.append(r"\end{itemize}")
-    header = _latex_escape(f"{project_name} | {target_year}年生态修复报告")
+    header = _latex_escape(f"{project_name} | {target_year}年生态状况智能诊断与修复决策报告")
     return rf'''\documentclass[12pt]{{article}}
 \usepackage[a4paper,top=2.54cm,bottom=2.54cm,left=3.0cm,right=2.6cm,headheight=15pt,headsep=16pt,footskip=28pt]{{geometry}}
 \usepackage{{fontspec}}
@@ -105,7 +136,7 @@ def render_latex_report(markdown: str, project_name: str, target_year: int) -> s
 \XeTeXlinebreaklocale "zh"
 \XeTeXlinebreakskip = 0pt plus 1pt
 \usepackage[table]{{xcolor}}
-\usepackage{{array,longtable,enumitem,fancyhdr,hyperref,graphicx}}
+\usepackage{{array,longtable,booktabs,enumitem,fancyhdr,hyperref,graphicx}}
 \definecolor{{ReportBlue}}{{HTML}}{{2E74B5}}
 \definecolor{{ReportDarkBlue}}{{HTML}}{{1F4D78}}
 \definecolor{{ReportInk}}{{HTML}}{{0B2545}}
@@ -178,15 +209,20 @@ def write_pdf_report(
             f"-output-directory={temporary}",
             str(source),
         ]
-        completed = subprocess.run(
-            command,
-            cwd=temporary,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout_seconds,
-        )
+        completed = None
+        for _ in range(2):
+            completed = subprocess.run(
+                command,
+                cwd=temporary,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            if completed.returncode != 0:
+                break
+        assert completed is not None
         generated = temporary / "report.pdf"
         if completed.returncode != 0 or not generated.is_file():
             log_tail = completed.stdout[-4000:]
@@ -224,22 +260,28 @@ def write_pdf_markdown(
         temporary = Path(directory)
         source = temporary / "report.tex"
         source.write_text(latex, encoding="utf-8")
-        completed = subprocess.run(
-            [
-                executable,
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                "-no-shell-escape",
-                f"-output-directory={temporary}",
-                str(source),
-            ],
-            cwd=temporary,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout_seconds,
-        )
+        command = [
+            executable,
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-no-shell-escape",
+            f"-output-directory={temporary}",
+            str(source),
+        ]
+        completed = None
+        for _ in range(2):
+            completed = subprocess.run(
+                command,
+                cwd=temporary,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            if completed.returncode != 0:
+                break
+        assert completed is not None
         generated = temporary / "report.pdf"
         if completed.returncode != 0 or not generated.is_file():
             raise RuntimeError(
