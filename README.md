@@ -17,19 +17,20 @@ LLM 环节（跨问题分析、正文撰写），中间产物统一落在 `Repor
 `eco-report build / render-markdown / render-docx / render-pdf / render-all`。
 
 **MVP 审核链**（`mvp.py` → dict 形式 `ReportIR`，`schema_version=2.3-mvp` /
-`2.4-mvp`）：在确定性事实之上加入受约束的 LLM 分析与正文撰写，是当前实际交付使用的
-链路。入口是 `scripts/build_mvp_review.py`（单项目）和
-`scripts/build_mvp_batch.py`（多项目批量，带断点续跑）。
+`2.4-mvp` / `2.5-mvp`，当前产出 `2.5-mvp`）：在确定性事实之上加入受约束的 LLM
+分析与正文撰写，是当前实际交付使用的链路。入口是 `scripts/build_mvp_review.py`
+（单项目）和 `scripts/build_mvp_batch.py`（多项目批量，带断点续跑）。
 
 ```text
-结构化 XLSX
-  → 确定性指标事实与问题诊断（mvp.py / evidence.py / measures.py）
+结构化 XLSX（0816 汇总表 → raw_batch.py 拆分逐项目快照）
+  → 确定性指标事实与问题诊断（mvp.py / evidence.py / measures.py /
+    snapshot_report.py / matching_results.py）
   → 受约束 LLM Analysis Builder（analysis_builder.py）
   → 无优先级排序的措施匹配（strategy.py）
-  → ReportIR 2.3-mvp
+  → ReportIR 2.5-mvp
   → 过滤后的 Writer 输入（llm_writer.py 的 build_writer_payload）
-  → LLM Writer（mvp_writer.py）
-  → 问题级边界修复
+  → LLM Writer 初稿 + 最多三轮修订（词法清理与专项校正版）
+  → 严格校验（mvp_writer.py）：全部通过才标记为 LLM 成功
   → Markdown / DOCX / PDF / 科研图表（mvp_charts.py）
   → 自动校验与基准计量
 ```
@@ -41,10 +42,12 @@ LLM 环节（跨问题分析、正文撰写），中间产物统一落在 `Repor
 - 问题优先级评分与排序模块未启用（`audit.priority_module_enabled=false`），措施按
   对应问题分组，不单独排序。
 - Writer 只接收 `build_writer_payload` 过滤后的输入：已剔除数据不足/不适用问题、
-  规则编号、来源审计和内部字段；输出经过事实边界、反向证据、机器语言和优先级语言
-  校验，越界时只回退受影响的问题段落，不推翻整篇。
-- 图表由 Matplotlib 统一低饱和配色生成 SVG/PDF/300dpi PNG；DOCX/PDF 表格使用标准
-  三线表；正文段落使用两字符首行缩进；DOCX 写入可点击的缓存目录与 TOC/PAGEREF 域。
+  规则编号、来源审计和内部字段；输出经过事实边界、反向证据、机器语言和篇幅校验。
+  仅含推测/机器语言违规时先走最小编辑清理请求；LLM 最终校验失败一律记为失败，
+  不再以确定性重建段落冒充成功。
+- 图表由 Matplotlib 统一低饱和配色生成 SVG/PDF/300dpi PNG（植被、景观、风险组合、
+  诊断矩阵四图）；DOCX/PDF 表格使用标准三线表；正文段落使用两字符首行缩进；
+  DOCX 写入可点击的缓存目录与 TOC/PAGEREF 域。
 
 ## 目录结构
 
@@ -70,15 +73,16 @@ src/eco_report_agent/
                                  云主机发布包打包与合成 smoke 工作簿
 
   mvp.py                        MVP 审核链的 ReportIR 构建（指标事实、问题诊断）
-  analysis_builder.py           受约束 LLM 跨问题分析（Analysis Builder）
-  llm_writer.py                 Writer 输入过滤与 LLM Writer 后端
-  mvp_writer.py                 模板/LLM 正文渲染与问题级边界修复、语言校验
-  mvp_charts.py                 Matplotlib 科研图表（植被、景观、诊断矩阵）
+  analysis_builder.py           受约束 LLM 问题级与跨问题分析（Analysis Builder）
+  llm_writer.py                 Writer 输入过滤、初稿与修订请求、机器语言反馈
+  mvp_writer.py                 正文渲染与严格校验（失败不修复为成功）
+  mvp_charts.py                 Matplotlib 科研图表（植被、景观、风险组合、诊断矩阵）
   mvp_bundle.py                 单项目 MVP 审核包组装，记录各阶段耗时
 
   checkpointing.py              原子写入、SHA-256 指纹、断点续跑用的 checkpoint 读写
   llm_http.py                   通用 OpenAI 兼容 HTTP 请求封装，含重试与致命错误分类
   raw_batch.py                  从原始多项目 XLSX 拆分出逐项目快照
+  matching_results.py           修复策略匹配表（solar/wind/coal 三表）按项目键读取
   batch_runner.py                多项目批量运行：分阶段并发爬升、失败重试、汇总统计
   snapshot_report.py            单项目快照 → 完整 MVP 报告包，供批量运行调用
   dify_deploy.py, dify_dsl.py    Dify DSL 生成与 Console 导入（默认 dry-run）
@@ -90,18 +94,25 @@ config/
   problem_rules.json            13 条问题规则：适用项目类型、所需指标、判定条件
   measure_knowledge.json        受控措施知识库：措施与目标问题、项目类型的映射
   analysis_config.json          指标→生态维度映射，供跨问题分析分组
-  reportir_schema.json          ReportIR 2.3-mvp/2.4-mvp 的 JSON Schema
+  reportir_schema.json          ReportIR 2.3/2.4/2.5-mvp 的 JSON Schema
   report_style_config.json      DOCX/PDF 页面、字体、字号样式参数
 
 scripts/
   build_mvp_review.py           单项目 MVP 审核包命令行入口
   build_mvp_batch.py            多项目批量命令行入口（prepare/run/resume/retry-failed）
+  export_reports_postgres.py, import_reports_postgres.py
+                                 PostgreSQL 两表（report_entry/report_chart）NDJSON
+                                 导出与导入；图表以 {{chart:N}} 占位符关联
   build_dify_dsl.py, deploy_dify_dsl.py
                                  Dify DSL 生成与部署脚本
   build_cloud_release.py(.sbatch), build_container.sbatch
                                  云主机发布包与容器构建（在 Slurm Job 内执行）
   run_core_tests.sbatch         在 Slurm Job 内运行 pytest
   submit_report_job.py          提交确定性链路报告生成 Job，默认 dry-run
+
+sql/
+  postgres_report_schema.sql    report_entry（Markdown 正文）与 report_chart
+                                （图表 data_json，按 insert_key 排序）两表定义
 
 deploy/
   Dockerfile, eco-report-agent.def   容器与 Apptainer 镜像定义
@@ -112,8 +123,9 @@ dify/
   eco_report_workflow.yml            由模板生成的可导入 DSL（Dify 1.16.1 / DSL 0.7.0）
 
 tests/
-  73 个测试用例，覆盖趋势计算、诊断规则、措施过滤、MVP 审核链、批量运行、文档渲染、
-  Dify DSL/部署、Slurm 任务构造、来源登记等。
+  96 个测试用例（含 2 个环境条件跳过项），覆盖趋势计算、诊断规则、措施过滤、
+  MVP 审核链、Writer 严格校验、0816 试点回归、批量运行与续传、文档渲染、
+  PostgreSQL 导出、Dify DSL/部署、Slurm 任务构造、来源登记等。
 ```
 
 ## 命令行使用
@@ -133,13 +145,16 @@ PYTHONPATH=src python scripts/build_mvp_review.py \
 用于回归测试。LLM 模式下密钥从 `--writer-api-key-env`（默认
 `ECO_REPORT_WRITER_API_KEY`）指定的环境变量读取，不接受命令行参数传入。
 
-多项目批量（带断点续跑）：
+多项目批量（带断点续跑，0816 汇总表 + 修复策略匹配表）：
 
 ```bash
 PYTHONPATH=src python scripts/build_mvp_batch.py \
-  --input private_inputs/source/raw_multi_project.xlsx --batch-id <batch-id> --year 2024 \
-  --writer-base-url ... --writer-model qwen \
-  --max-concurrency 30 --ramp 5,10,20,30 \
+  --input private_inputs/source/项目汇总指标_20260816.xlsx \
+  --matching-input private_inputs/source/repair_strategy_matching_20260816.xlsx \
+  --batch-id <batch-id> --year 2024 \
+  --writer-base-url https://models.sjtu.edu.cn/api/v1 --writer-model deepseek-chat \
+  --api-key-env DEEPSEEK_API_KEY \
+  --max-concurrency 4 --ramp 4 --requests-per-minute 30 \
   --render-concurrency 4 --stop-before-end-seconds 2700 \
   --output-root outputs/batches
 ```
@@ -160,15 +175,35 @@ PYTHONPATH=src python scripts/build_mvp_batch.py \
 
 ```bash
 PYTHONPATH=src python scripts/build_mvp_batch.py \
-  --input private_inputs/source/raw_multi_project.xlsx --batch-id <batch-id> --year 2024 \
+  --input private_inputs/source/项目汇总指标_20260816.xlsx \
+  --matching-input private_inputs/source/repair_strategy_matching_20260816.xlsx \
+  --batch-id <batch-id> --year 2024 \
   --resume --project-name-map private_inputs/project_names.json \
-  --writer-base-url ... --writer-model qwen
+  --writer-base-url https://models.sjtu.edu.cn/api/v1 --writer-model deepseek-chat \
+  --api-key-env DEEPSEEK_API_KEY
 ```
 
 映射键使用 `project_type + FID` 形成的唯一键（如 `solar-0026`）。名称变化不会失效
 Analysis Builder 或图表，只会重新生成 Writer、Markdown、DOCX、PDF 和 manifest。
 模型响应在写入请求级 checkpoint 前会经过对应的结构与事实边界校验；旧 checkpoint
 在复用前同样复验。阶段内 API 重试次数占总尝试次数超过 10% 时，控制器暂停放量。
+
+严格成功口径：`writer_backend=llm`、`writer_boundary_repaired=false`、
+`writer_fallback_reason=null`、`validation.valid=true` 且 manifest 中文件哈希匹配，
+四者缺一不可。
+
+PostgreSQL 两表导出（不直连数据库，仅生成/回放 NDJSON 测试包）：
+
+```bash
+PYTHONPATH=src python scripts/export_reports_postgres.py \
+  --batch-dir outputs/batches/<batch-id> --output-dir outputs/db_exports/<name>
+PYTHONPATH=src python scripts/import_reports_postgres.py \
+  --bundle-dir outputs/db_exports/<name> --dry-run
+```
+
+导出只纳入 `validation_report.json` 中 `valid=true`、`writer_backend=llm` 且无
+`writer_fallback_reason` 的项目；正文中的图片地址改写为 `{{chart:N}}` 占位符，
+顺序与正文位置一致，与 `report_chart` 子表记录一一对应。
 
 确定性链路（不含 LLM，用于旧格式对比或回归基线）：
 
