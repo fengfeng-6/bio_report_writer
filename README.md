@@ -137,14 +137,38 @@ PYTHONPATH=src python scripts/build_mvp_review.py \
 
 ```bash
 PYTHONPATH=src python scripts/build_mvp_batch.py \
-  --input private_inputs/source/raw_multi_project.xlsx --batch-id <batch-id> --year 2025 \
+  --input private_inputs/source/raw_multi_project.xlsx --batch-id <batch-id> --year 2024 \
   --writer-base-url ... --writer-model qwen \
   --max-concurrency 30 --ramp 5,10,20,30 \
+  --render-concurrency 4 --stop-before-end-seconds 2700 \
   --output-root outputs/batches
 ```
 
-`--prepare-only` 只拆分逐项目快照；`--resume` / `--retry-failed` 依据
-`checkpointing.py` 写入的原子 checkpoint 跳过已完成项目、重试失败项目。
+首次运行可加 `--prepare-only`，一次读取原始 7 个工作表并拆分逐项目只读快照；同名批次
+目录只有显式 `--resume` 才能复用。续跑时使用 `--resume`，若还要重新入队上次失败项目则
+同时加 `--retry-failed`。`--project-type`、`--fids` 和 `--project-keys` 可用于抽样或定向
+重跑。每个请求、ReportIR、Writer、图表和文档阶段均写入同目录原子 checkpoint；指纹一致
+且校验通过的阶段不会重复调用模型。批次状态为 `complete`、`complete_with_failures` 或
+`paused`，只有选定项目全部校验成功时命令返回完整成功。
+
+批次目录固定为 `outputs/batches/<batch-id>/`，包含输入 SHA-256 清单、项目快照、逐项目
+检查点与报告、`progress.json`、`summary.csv` 和脱敏失败清单。`batch.lock` 防止两个控制器
+并行消费同一批次；默认在 Slurm Job 结束前 45 分钟停止领取新项目。API key 只能通过
+`--api-key-env` 指定的环境变量继承，不能放入命令参数、状态文件或日志。
+
+后续取得正式项目名称后，可提供 UTF-8 JSON 映射并在原批次续跑：
+
+```bash
+PYTHONPATH=src python scripts/build_mvp_batch.py \
+  --input private_inputs/source/raw_multi_project.xlsx --batch-id <batch-id> --year 2024 \
+  --resume --project-name-map private_inputs/project_names.json \
+  --writer-base-url ... --writer-model qwen
+```
+
+映射键使用 `project_type + FID` 形成的唯一键（如 `solar-0026`）。名称变化不会失效
+Analysis Builder 或图表，只会重新生成 Writer、Markdown、DOCX、PDF 和 manifest。
+模型响应在写入请求级 checkpoint 前会经过对应的结构与事实边界校验；旧 checkpoint
+在复用前同样复验。阶段内 API 重试次数占总尝试次数超过 10% 时，控制器暂停放量。
 
 确定性链路（不含 LLM，用于旧格式对比或回归基线）：
 
