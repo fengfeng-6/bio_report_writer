@@ -8,7 +8,10 @@ import urllib.error
 import urllib.request
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
+
+from .llm_http import request_chat_json
 
 
 LONG_FEATURES = {
@@ -295,6 +298,14 @@ shared_signals 只能引用输入已有指标和问题 ID。
 不得改变单问题结论，不得增加原因、现场事实、指标、问题、措施或工程参数。不要输出 Markdown。"""
 
 
+def _cacheable_problem_response(seed: dict[str, Any], response: dict[str, Any]) -> bool:
+    try:
+        merge_problem_analysis(seed, response.get("problem", response))
+        return True
+    except ValueError:
+        return False
+
+
 @dataclass(frozen=True)
 class OpenAICompatibleAnalysisConfig:
     base_url: str
@@ -303,6 +314,8 @@ class OpenAICompatibleAnalysisConfig:
     timeout_seconds: int = 180
     temperature: float = 0.1
     max_tokens: int = 10000
+    checkpoint_directory: Path | None = None
+    max_attempts: int = 4
 
 
 class OpenAICompatibleAnalysisBackend:
@@ -313,48 +326,64 @@ class OpenAICompatibleAnalysisBackend:
         self.fallback_problem_ids: list[str] = []
         self.cross_fallback = False
         self.request_count = 0
+        self.logical_request_count = 0
+        self.retry_count = 0
         self.request_durations_seconds: list[float] = []
 
-    def _request(self, payload: dict[str, Any], prompt: str, max_tokens: int | None = None) -> dict[str, Any]:
-        api_key = os.environ.get(self.config.api_key_env, "").strip()
-        if not api_key:
-            raise RuntimeError(f"missing API key environment variable: {self.config.api_key_env}")
-        endpoint = self.config.base_url.rstrip("/")
-        if not endpoint.endswith("/chat/completions"):
-            endpoint += "/chat/completions"
-        body = {
-            "model": self.config.model,
-            "temperature": self.config.temperature,
-            "max_tokens": max_tokens or self.config.max_tokens,
-            "response_format": {"type": "json_object"},
-            "messages": [
+    def _request(
+        self,
+        payload: dict[str, Any],
+        prompt: str,
+        max_tokens: int | None = None,
+    ) -> dict[str, Any]:
+        label = getattr(self, "_active_request_label", "analysis")
+        cache_validator = getattr(self, "_active_cache_validator", None)
+        result, attempts, durations, cached = request_chat_json(
+            base_url=self.config.base_url,
+            model=self.config.model,
+            api_key_env=self.config.api_key_env,
+            timeout_seconds=self.config.timeout_seconds,
+            temperature=self.config.temperature,
+            max_tokens=max_tokens or self.config.max_tokens,
+            messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
             ],
-        }
-        request = urllib.request.Request(
-            endpoint,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            method="POST",
+            label=label,
+            checkpoint_directory=self.config.checkpoint_directory,
+            max_attempts=self.config.max_attempts,
+            cache_validator=cache_validator,
         )
-        self.request_count += 1
-        started = time.perf_counter()
+        self.request_count += attempts
+        if not cached:
+            self.logical_request_count += 1
+            self.retry_count += max(0, attempts - 1)
+        self.request_durations_seconds.extend(durations)
+        return result
+
+    def _request_labeled(
+        self,
+        payload: dict[str, Any],
+        prompt: str,
+        *,
+        label: str,
+        max_tokens: int | None = None,
+        cache_validator: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> dict[str, Any]:
+        self._active_request_label = label
+        self._active_cache_validator = cache_validator
         try:
-            with urllib.request.urlopen(request, timeout=self.config.timeout_seconds) as response:
-                result = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read(1000).decode("utf-8", errors="replace")
-            raise RuntimeError(f"analysis API HTTP {exc.code}: {detail}") from exc
+            return self._request(payload, prompt, max_tokens)
         finally:
-            self.request_durations_seconds.append(round(time.perf_counter() - started, 3))
-        content = result["choices"][0]["message"]["content"]
-        return content if isinstance(content, dict) else json.loads(content)
+            self._active_request_label = None
+            self._active_cache_validator = None
 
     def __call__(self, payload: dict[str, Any]) -> dict[str, Any]:
         self.fallback_problem_ids = []
         self.cross_fallback = False
         self.request_count = 0
+        self.logical_request_count = 0
+        self.retry_count = 0
         self.request_durations_seconds = []
         fact_map = {item["indicator"]: item for item in payload["indicator_facts"]}
         rule_map = {item["problem_id"]: item for item in payload["problem_rules"]}
@@ -376,7 +405,14 @@ class OpenAICompatibleAnalysisBackend:
                 "problem": problem,
             }
             print(f"[analysis-builder] requesting {problem['problem_id']}", flush=True)
-            result = self._request(unit, PROBLEM_ANALYSIS_PROMPT)
+            result = self._request_labeled(
+                unit,
+                PROBLEM_ANALYSIS_PROMPT,
+                label=f"{problem['problem_id']}-initial",
+                cache_validator=lambda response, seed=problem: _cacheable_problem_response(
+                    seed, response
+                ),
+            )
             raw_problem = result.get("problem", result)
             try:
                 merged = merge_problem_analysis(problem, raw_problem)
@@ -384,7 +420,15 @@ class OpenAICompatibleAnalysisBackend:
                 correction = dict(unit)
                 correction["rejected_response"] = raw_problem
                 correction["validation_error"] = str(exc)
-                result = self._request(correction, PROBLEM_ANALYSIS_PROMPT + "\n上一次输出未通过校验。请仅修正指出的问题，不扩大事实边界。")
+                result = self._request_labeled(
+                    correction,
+                    PROBLEM_ANALYSIS_PROMPT
+                    + "\n上一次输出未通过校验。请仅修正指出的问题，不扩大事实边界。",
+                    label=f"{problem['problem_id']}-correction",
+                    cache_validator=lambda response, seed=problem: _cacheable_problem_response(
+                        seed, response
+                    ),
+                )
                 try:
                     merged = merge_problem_analysis(problem, result.get("problem", result))
                 except ValueError:
@@ -397,6 +441,17 @@ class OpenAICompatibleAnalysisBackend:
                     print(f"[analysis-builder] boundary fallback {problem['problem_id']}", flush=True)
             generated.append(merged)
             print(f"[analysis-builder] completed {problem['problem_id']}", flush=True)
+        reportable_problem_ids = {
+            problem["problem_id"]
+            for problem in payload["problems"]
+            if problem["applicability"] == "applicable"
+            and problem["data_sufficiency"] == "sufficient"
+        }
+        omitted_problem_names = {
+            problem["problem_name"]
+            for problem in payload["problems"]
+            if problem["problem_id"] not in reportable_problem_ids
+        }
         cross_input = {
             "project": payload["project"],
             "problems": [
@@ -408,21 +463,53 @@ class OpenAICompatibleAnalysisBackend:
                     "analysis_context": item["analysis_context"],
                 }
                 for item in generated
+                if item["problem_id"] in reportable_problem_ids
             ],
             "cross_problem_analysis": payload["cross_problem_analysis"],
         }
+
+        def merge_checked_cross(raw: Any) -> dict[str, Any]:
+            merged = merge_cross_analysis(payload["cross_problem_analysis"], raw)
+            merged_text = json.dumps(merged, ensure_ascii=False)
+            leaked = sorted(name for name in omitted_problem_names if name in merged_text)
+            if leaked:
+                raise ValueError("cross analysis leaked omitted problems: " + ",".join(leaked))
+            return merged
+
+        def cacheable_cross_response(response: dict[str, Any]) -> bool:
+            try:
+                merge_checked_cross(response.get("cross_problem_analysis", response))
+                return True
+            except ValueError:
+                return False
+
         print("[analysis-builder] requesting cross_problem_analysis", flush=True)
-        cross_result = self._request(cross_input, CROSS_ANALYSIS_PROMPT, max_tokens=4000)
+        cross_result = self._request_labeled(
+            cross_input,
+            CROSS_ANALYSIS_PROMPT,
+            max_tokens=4000,
+            label="cross-problem-initial",
+            cache_validator=cacheable_cross_response,
+        )
         raw_cross = cross_result.get("cross_problem_analysis", cross_result)
         try:
-            cross = merge_cross_analysis(payload["cross_problem_analysis"], raw_cross)
+            cross = merge_checked_cross(raw_cross)
         except ValueError as exc:
             correction = dict(cross_input)
             correction["rejected_response"] = raw_cross
             correction["validation_error"] = str(exc)
-            cross_result = self._request(correction, CROSS_ANALYSIS_PROMPT + "\n上一次输出未通过校验。请仅修正结构和引用，不新增事实。", max_tokens=4000)
+            cross_result = self._request_labeled(
+                correction,
+                CROSS_ANALYSIS_PROMPT
+                + "\n上一次输出未通过校验。请仅修正结构和引用，不新增事实。",
+                max_tokens=4000,
+                label="cross-problem-correction",
+                cache_validator=cacheable_cross_response,
+            )
             try:
-                cross = merge_cross_analysis(payload["cross_problem_analysis"], cross_result.get("cross_problem_analysis", cross_result))
+                cross = merge_checked_cross(
+                    cross_result.get("cross_problem_analysis", cross_result)
+                )
             except ValueError:
                 self.cross_fallback = True
                 cross = deepcopy(payload["cross_problem_analysis"])

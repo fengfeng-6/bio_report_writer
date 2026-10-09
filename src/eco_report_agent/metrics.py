@@ -8,6 +8,8 @@ from .models import Observation, TrendEvidence
 TREND_FIELDS = (
     "MEAN_NDVI",
     "MEAN_NPP",
+    "MEAN_NEP",
+    "MEAN_NCS",
     "CA",
     "LPI",
     "NP",
@@ -19,6 +21,7 @@ TREND_FIELDS = (
     "MEAN_SIF",
     "MEAN_VCS_C",
     "MEAN_VCS_CO2e",
+    "MEAN_VCR",
     "ERI",
 )
 

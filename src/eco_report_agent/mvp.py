@@ -4,10 +4,12 @@ import json
 import math
 import re
 from dataclasses import asdict
+from datetime import date
 from pathlib import Path
 from statistics import median
 from typing import Any
 
+from .analysis_builder import build_analysis_material
 from .evidence import split_risk_types
 from .ingest import InputValidationError, load_project_series
 from .measures import filter_measures
@@ -16,13 +18,6 @@ from .models import DataScope, Observation, ProjectType
 
 
 CONFIG_ROOT = Path(__file__).resolve().parents[2] / "config"
-PRIORITY_WEIGHTS = {"existence": 0.35, "severity": 0.25, "confidence": 0.25, "trend": 0.15}
-PRIORITY_FACTORS = {
-    "existence": {"confirmed": 1.0, "possible": 0.6, "not_observed": 0.2, "unknown": 0.0, "not_applicable": 0.0},
-    "severity": {"high": 1.0, "medium": 0.6, "low": 0.2, "unknown": 0.0},
-    "confidence": {"high": 1.0, "medium": 0.7, "low": 0.4, "not_assessable": 0.0},
-    "trend": {"worsening": 1.0, "recently_worsening": 0.9, "mixed": 0.6, "stable": 0.5, "recently_improving": 0.4, "improving": 0.2, "unknown": 0.0},
-}
 
 
 def load_json_config(name: str) -> Any:
@@ -64,16 +59,24 @@ def _piecewise_pattern(years: list[int], values: list[float], threshold: float, 
 
 
 def build_indicator_fact(series: list[Observation], indicator: str, config: dict[str, Any]) -> dict[str, Any]:
-    points = [(item.year, item.number(indicator)) for item in series]
-    valid = [(year, value) for year, value in points if value is not None and math.isfinite(value)]
-    years = [year for year, _ in valid]
-    values = [float(value) for _, value in valid]
-    missing = [year for year, value in points if value is None]
+    points = [(item.year, item.number(indicator), item.source_row) for item in series]
+    valid = [(year, value, source_row) for year, value, source_row in points if value is not None and math.isfinite(value)]
+    years = [year for year, _, _ in valid]
+    values = [float(value) for _, value, _ in valid]
+    missing = [year for year, value, _ in points if value is None]
     minimum_years = int(config["minimum_valid_years"])
     fact: dict[str, Any] = {
+        "fact_id": f"IF-{indicator}",
         "indicator": indicator,
         "valid": len(valid) >= minimum_years,
-        "time_series": [{"year": year, "value": value} for year, value in valid],
+        "time_series": [
+            {
+                "year": year,
+                "value": value,
+                "source_ref": {"row": source_row, "field": indicator},
+            }
+            for year, value, source_row in valid
+        ],
         "statistics": {},
         "trend": {"long_term": "unknown", "recent": "unknown", "turning_points": []},
         "quality": {"valid_year_count": len(valid), "missing_years": missing, "sufficiency": "sufficient" if len(valid) >= minimum_years else "insufficient"},
@@ -171,7 +174,7 @@ def build_problem_diagnoses(project_type: str, risk_types: list[str], facts: lis
             support.append(item_support)
             recent = fact["trend"]["recent"]
             recent_effects.append("adverse" if recent == adverse else "improving" if recent in {"up", "down"} else "stable")
-            evidence.append({"indicator": indicator, "fact_ref": f"indicator:{indicator}", "adverse_direction": adverse, "observed_direction": direction, "supports_problem": item_support})
+            evidence.append({"evidence_id": f"EV-{problem_id}-{indicator}", "indicator": indicator, "fact_ref": f"IF-{indicator}", "adverse_direction": adverse, "observed_direction": direction, "supports_problem": item_support})
         supported = sum(value is True for value in support)
         opposed = sum(value is False for value in support)
         total = len(support)
@@ -209,41 +212,71 @@ def build_problem_diagnoses(project_type: str, risk_types: list[str], facts: lis
 
 
 def _diagnosis_record(rule: dict[str, Any], existence: str, severity: str, trend: str, confidence: str, consistency: str, evidence_level: str, evidence: list[dict[str, Any]], limitations: list[str], status: str) -> dict[str, Any]:
-    return {"problem_id": rule["problem_id"], "problem_name": rule["problem_name"], "applicability": "not_applicable" if status == "不适用" else "applicable", "data_sufficiency": "insufficient" if status == "数据不足" else "sufficient", "status": status, "existence": existence, "severity": severity, "trend": trend, "confidence": confidence, "evidence_consistency": consistency, "evidence_level": evidence_level, "supporting_indicators": rule["required_indicators"], "evidence": evidence, "limitations": limitations}
+    problem_id = rule["problem_id"]
+    return {
+        "problem_id": problem_id,
+        "problem_name": rule["problem_name"],
+        "applicability": "not_applicable" if status == "不适用" else "applicable",
+        "data_sufficiency": "insufficient" if status == "数据不足" else "sufficient",
+        "status": status,
+        "existence": existence,
+        "severity": severity,
+        "trend": trend,
+        "confidence": confidence,
+        "evidence_consistency": consistency,
+        "evidence_level": evidence_level,
+        "supporting_indicators": rule["required_indicators"],
+        "evidence": evidence,
+        "limitations": limitations,
+        "provenance": {
+            "rule_id": f"PR-{problem_id}",
+            "rule_version": "2.1-mvp",
+            "rule_source": "config/problem_rules.json",
+        },
+    }
 
 
-def build_priority_assessment(diagnoses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    results = []
-    for item in diagnoses:
-        if item["status"] in {"数据不足", "不适用"}:
-            score, level, factors = 0.0, "P0", {name: 0.0 for name in PRIORITY_WEIGHTS}
-        else:
-            factors = {name: PRIORITY_FACTORS[name][item[name]] for name in PRIORITY_WEIGHTS}
-            score = sum(PRIORITY_WEIGHTS[name] * factors[name] for name in PRIORITY_WEIGHTS)
-            level = "P1" if score >= 0.75 else "P2" if score >= 0.55 else "P3" if score >= 0.35 else "P0"
-            if item["evidence_level"] != "A" and level == "P1":
-                level = "P2"
-        results.append({"problem_id": item["problem_id"], "problem_name": item["problem_name"], "priority_score": round(score, 6), "priority_level": level, "factors": factors})
-    return results
-
-
-def build_measure_recommendations(raw: str, project_type: str, scope: DataScope, diagnoses: list[dict[str, Any]], priorities: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def build_measure_recommendations(
+    raw: str,
+    project_type: str,
+    scope: DataScope,
+    diagnoses: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Match compliant measures and group them by reportable problem, without priority scoring."""
     candidate_audit = filter_measures(raw, ProjectType(project_type), scope)
     candidates = {item.text: item for item in candidate_audit if item.accepted}
     knowledge = load_json_config("measure_knowledge.json")
-    priority_map = {item["problem_id"]: item for item in priorities}
-    diagnosis_map = {item["problem_id"]: item for item in diagnoses}
+    reportable = [
+        item["problem_id"] for item in diagnoses
+        if item["status"] not in {"数据不足", "不适用"}
+    ]
+    problem_order = {problem_id: index for index, problem_id in enumerate(reportable)}
     recommendations: list[dict[str, Any]] = []
-    selected_names: set[str] = set()
-    for problem_id, priority in sorted(priority_map.items(), key=lambda pair: (-pair[1]["priority_score"], pair[0])):
-        level = priority["priority_level"]
-        limit = 3 if level in {"P1", "P2"} else 1 if level == "P3" else 0
-        if not limit:
+    eligible = [
+        item
+        for item in knowledge
+        if item["name"] in candidates and project_type in item["applicable_project_types"]
+    ]
+    for item in eligible:
+        targets = [
+            problem_id
+            for problem_id in item["target_problem_ids"]
+            if problem_id in problem_order
+        ]
+        if not targets:
             continue
-        matches = [item for item in knowledge if item["name"] in candidates and project_type in item["applicable_project_types"] and problem_id in item["target_problem_ids"] and item["name"] not in selected_names]
-        for item in matches[:limit]:
-            recommendations.append({"measure_id": item["measure_id"], "name": item["name"], "target_problem_ids": [problem_id], "priority": level, "mechanism": item["mechanism"], "parameter_status": "not_provided", "implementation_parameters": None, "source_record": candidates[item["name"]].source})
-            selected_names.add(item["name"])
+        targets.sort(key=problem_order.__getitem__)
+        recommendations.append({
+            "measure_id": item["measure_id"],
+            "name": item["name"],
+            "target_problem_ids": targets,
+            "mechanism": item["mechanism"],
+            "parameter_status": "not_provided",
+            "implementation_parameters": None,
+            "source_record": candidates[item["name"]].source,
+            "knowledge_ref": {"config": "config/measure_knowledge.json", "measure_id": item["measure_id"]},
+        })
+    recommendations.sort(key=lambda item: (problem_order[item["target_problem_ids"][0]], item["measure_id"]))
     audit = [asdict(item) for item in candidate_audit]
     known_names = {item["name"] for item in knowledge}
     audit.extend({"text": name, "accepted": False, "reason": "not_in_measure_knowledge", "source": candidates[name].source} for name in sorted(set(candidates) - known_names))
@@ -259,6 +292,8 @@ def validate_json_schema_subset(instance: dict[str, Any], schema: dict[str, Any]
     for name, rule in schema.get("properties", {}).items():
         if name in instance and "const" in rule and instance[name] != rule["const"]:
             errors.append(f"schema_const:{name}")
+        if name in instance and "enum" in rule and instance[name] not in rule["enum"]:
+            errors.append(f"schema_enum:{name}")
         if name in instance and rule.get("type") == "array" and not isinstance(instance[name], list):
             errors.append(f"schema_type:{name}")
     return errors
@@ -267,26 +302,75 @@ def validate_json_schema_subset(instance: dict[str, Any], schema: dict[str, Any]
 def validate_report_ir_mvp(report: dict[str, Any]) -> list[str]:
     schema = load_json_config("reportir_schema.json")
     errors: list[str] = validate_json_schema_subset(report, schema)
-    required = {"schema_version", "report_metadata", "project", "data_profile", "indicator_facts", "problem_diagnoses", "overall_assessment", "priority_assessment", "measure_recommendations", "report_assets", "audit"}
+    required = {"schema_version", "report_metadata", "project", "data_profile", "indicator_facts", "problem_diagnoses", "overall_assessment", "cross_problem_analysis", "measure_recommendations", "report_assets", "audit"}
     errors.extend(f"missing_top_level:{name}" for name in sorted(required - set(report)))
-    if report.get("schema_version") != "2.0-mvp":
+    if report.get("schema_version") not in {"2.3-mvp", "2.4-mvp", "2.5-mvp"}:
         errors.append("invalid_schema_version")
-    priority = {item["problem_id"]: item["priority_level"] for item in report.get("priority_assessment", [])}
+    if report.get("schema_version") in {"2.4-mvp", "2.5-mvp"}:
+        spatial = report.get("spatial_evidence")
+        if not isinstance(spatial, dict):
+            errors.append("missing_spatial_evidence")
+        elif spatial.get("landscape_class_semantics") not in {"unknown_codes", "mapped_cls_v1"}:
+            errors.append("invalid_landscape_class_semantics")
+        risk = report.get("overall_assessment", {})
+        if risk.get("risk_level_status") not in {"provided", "not_provided"}:
+            errors.append("invalid_risk_level_status")
+        if risk.get("risk_level_status") == "provided" and not risk.get("risk_level"):
+            errors.append("missing_provided_risk_level")
+    if report.get("schema_version") == "2.5-mvp":
+        evidence = report.get("risk_evidence")
+        if not isinstance(evidence, dict):
+            errors.append("missing_risk_evidence")
+        else:
+            for name in ("current", "trend", "spatial_gradient", "annual_series", "source_scope", "quality_flags"):
+                if name not in evidence:
+                    errors.append(f"missing_risk_evidence:{name}")
+            if not isinstance(evidence.get("current"), dict):
+                errors.append("invalid_risk_evidence:current")
+            elif any(field not in evidence["current"] for field in ("risk_level", "risk_level_code", "values")):
+                errors.append("invalid_risk_evidence:current_fields")
+            if not isinstance(evidence.get("trend"), dict) or evidence.get("trend", {}).get("aggregation") != "multi_scope_mean":
+                errors.append("invalid_risk_evidence:trend")
+            if not isinstance(evidence.get("spatial_gradient"), list):
+                errors.append("invalid_risk_evidence:spatial_gradient")
+            if not isinstance(evidence.get("annual_series"), list):
+                errors.append("invalid_risk_evidence:annual_series")
+            if not isinstance(evidence.get("quality_flags"), list):
+                errors.append("invalid_risk_evidence:quality_flags")
     diagnoses = {item["problem_id"]: item for item in report.get("problem_diagnoses", [])}
     for problem_id, item in diagnoses.items():
         if item["status"] == "数据不足" and item["existence"] == "confirmed":
             errors.append(f"insufficient_confirmed:{problem_id}")
-        if item["status"] in {"数据不足", "不适用"} and priority.get(problem_id) != "P0":
-            errors.append(f"invalid_priority:{problem_id}")
+        if not item.get("analysis_features") or "analysis_context" not in item:
+            errors.append(f"missing_analysis_context:{problem_id}")
+        if "diagnosis" not in item:
+            errors.append(f"missing_nested_diagnosis:{problem_id}")
+        if "provenance" not in item:
+            errors.append(f"missing_problem_provenance:{problem_id}")
+        for evidence in item.get("evidence", []):
+            if not evidence.get("evidence_id") or not evidence.get("fact_ref"):
+                errors.append(f"missing_evidence_provenance:{problem_id}")
     for measure in report.get("measure_recommendations", []):
-        if any(priority.get(problem_id) == "P0" for problem_id in measure["target_problem_ids"]):
-            errors.append(f"measure_for_p0:{measure['measure_id']}")
+        if any(diagnoses.get(problem_id, {}).get("status") in {"数据不足", "不适用"} for problem_id in measure["target_problem_ids"]):
+            errors.append(f"measure_for_omitted_problem:{measure['measure_id']}")
+        if "priority" in measure:
+            errors.append(f"measure_priority_present:{measure['measure_id']}")
         if measure.get("parameter_status") == "not_provided" and measure.get("implementation_parameters") is not None:
             errors.append(f"invented_parameters:{measure['measure_id']}")
     return errors
 
 
-def build_report_ir_mvp(workbook_path: str | Path, project_type: str, fid: int, target_year: int | None = None, project_name: str | None = None, data_scope: DataScope | None = None) -> dict[str, Any]:
+def build_report_ir_mvp(
+    workbook_path: str | Path,
+    project_type: str,
+    fid: int,
+    target_year: int | None = None,
+    project_name: str | None = None,
+    data_scope: DataScope | None = None,
+    generated_date: str | None = None,
+    prepared_by: str = "生态状况评估编制组",
+    analysis_backend: Any = None,
+) -> dict[str, Any]:
     project = ProjectType(project_type)
     series = load_project_series(workbook_path, project, fid)
     if target_year is not None:
@@ -300,25 +384,51 @@ def build_report_ir_mvp(workbook_path: str | Path, project_type: str, fid: int, 
     scope = data_scope or DataScope()
     facts = build_indicator_facts(series)
     risk_types = split_risk_types(target.text("RISK_TYPES"))
-    diagnoses = build_problem_diagnoses(project.value, risk_types, facts, scope)
-    priorities = build_priority_assessment(diagnoses)
-    measures, measure_audit = build_measure_recommendations(target.text("MEASURE_TEXT"), project.value, scope, diagnoses, priorities)
+    rules = load_json_config("problem_rules.json")
+    diagnoses = build_problem_diagnoses(project.value, risk_types, facts, scope, rules)
+    measures, measure_audit = build_measure_recommendations(target.text("MEASURE_TEXT"), project.value, scope, diagnoses)
+    analysis_config = load_json_config("analysis_config.json")
+    project_record = {"fid": int(fid), "name": project_name or f"FID {fid}项目", "project_type": project.value, "project_attributes": asdict(scope)}
+    diagnoses, cross_problem_analysis, analysis_backend_name = build_analysis_material(
+        project_record, diagnoses, facts, measures, rules, analysis_config, analysis_backend
+    )
     available = [item["indicator"] for item in facts if item["valid"]]
     missing = [item["indicator"] for item in facts if not item["valid"]]
     report = {
-        "schema_version": "2.0-mvp",
-        "report_metadata": {"report_id": f"eco-{project.value}-{fid}-{target.year}", "report_title": "生态状况智能诊断与修复决策报告", "current_year": target.year, "evaluation_start_year": series[0].year, "evaluation_end_year": target.year},
-        "project": {"fid": int(fid), "name": project_name or f"FID {fid}项目", "project_type": project.value, "project_attributes": asdict(scope)},
+        "schema_version": "2.3-mvp",
+        "report_metadata": {"report_id": f"eco-{project.value}-{fid}-{target.year}", "report_title": "生态状况智能诊断与修复决策报告", "current_year": target.year, "evaluation_start_year": series[0].year, "evaluation_end_year": target.year, "generated_date": generated_date or date.today().isoformat(), "prepared_by": prepared_by},
+        "project": project_record,
         "data_profile": {"available_indicators": available, "missing_indicators": missing, "known_limitations": sorted({limitation for item in diagnoses for limitation in item["limitations"]})},
         "indicator_facts": facts,
         "problem_diagnoses": diagnoses,
         "overall_assessment": {"risk_level": target.text("RISK_LEVEL"), "risk_level_code": target.number("RISK_LEVEL_CODE"), "reported_risk_types": risk_types},
-        "priority_assessment": priorities,
+        "cross_problem_analysis": cross_problem_analysis,
         "measure_recommendations": measures,
         "report_assets": {"charts": [], "tables": []},
-        "audit": {"source_sheet": project.value, "source_row": target.source_row, "source_years": [item.year for item in series], "schema_config": "config/reportir_schema.json", "rule_config": "config/problem_rules.json", "trend_config": "config/trend_config.json", "measure_config": "config/measure_knowledge.json", "measure_filter": measure_audit},
+        "audit": {
+            "source_sheet": project.value,
+            "source_row": target.source_row,
+            "source_years": [item.year for item in series],
+            "schema_config": "config/reportir_schema.json",
+            "rule_config": "config/problem_rules.json",
+            "trend_config": "config/trend_config.json",
+            "analysis_config": "config/analysis_config.json",
+            "analysis_backend": analysis_backend_name,
+            "analysis_fallback_problem_ids": list(getattr(analysis_backend, "fallback_problem_ids", [])),
+            "analysis_cross_fallback": bool(getattr(analysis_backend, "cross_fallback", False)),
+            "analysis_request_count": int(getattr(analysis_backend, "request_count", 0)),
+            "analysis_request_durations_seconds": list(
+                getattr(analysis_backend, "request_durations_seconds", [])
+            ),
+            "analysis_request_seconds": round(
+                sum(getattr(analysis_backend, "request_durations_seconds", [])), 3
+            ),
+            "priority_module_enabled": False,
+            "measure_config": "config/measure_knowledge.json",
+            "measure_filter": measure_audit,
+        },
     }
     errors = validate_report_ir_mvp(report)
     if errors:
-        raise InputValidationError("Invalid ReportIR 2.0-mvp: " + ", ".join(errors))
+        raise InputValidationError("Invalid ReportIR 2.3-mvp: " + ", ".join(errors))
     return report

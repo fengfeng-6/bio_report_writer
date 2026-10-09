@@ -1,1 +1,56 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"Eco ReportIR 2.0 MVP","type":"object","required":["schema_version","report_metadata","project","data_profile","indicator_facts","problem_diagnoses","overall_assessment","priority_assessment","measure_recommendations","report_assets","audit"],"properties":{"schema_version":{"const":"2.0-mvp"},"report_metadata":{"type":"object"},"project":{"type":"object"},"data_profile":{"type":"object"},"indicator_facts":{"type":"array"},"problem_diagnoses":{"type":"array"},"overall_assessment":{"type":"object"},"priority_assessment":{"type":"array"},"measure_recommendations":{"type":"array"},"report_assets":{"type":"object"},"audit":{"type":"object"}},"additionalProperties":false}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Eco ReportIR 2.5 MVP",
+  "type": "object",
+  "required": [
+    "schema_version", "report_metadata", "project", "data_profile",
+    "indicator_facts", "problem_diagnoses", "overall_assessment",
+    "cross_problem_analysis",
+    "measure_recommendations", "report_assets", "audit"
+  ],
+  "properties": {
+    "schema_version": {"enum": ["2.3-mvp", "2.4-mvp", "2.5-mvp"]},
+    "report_metadata": {
+      "type": "object",
+      "required": ["report_id", "report_title", "current_year", "generated_date", "prepared_by"]
+    },
+    "project": {"type": "object"},
+    "region": {"type": "object"},
+    "data_profile": {"type": "object"},
+    "indicator_facts": {
+      "type": "array",
+      "items": {"type": "object", "required": ["fact_id", "indicator", "time_series", "trend", "quality"]}
+    },
+    "problem_diagnoses": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "problem_id", "problem_name", "applicability", "data_sufficiency",
+          "diagnosis", "evidence", "provenance", "analysis_features", "analysis_context"
+        ],
+        "properties": {
+          "diagnosis": {
+            "type": "object",
+            "required": ["status", "existence", "severity", "trend", "confidence", "evidence_level", "evidence_consistency"]
+          },
+          "analysis_context": {
+            "type": "object",
+            "required": ["basis", "temporal", "indicator_synthesis", "evidence_balance", "interpretation", "uncertainty", "restoration"]
+          }
+        }
+      }
+    },
+    "overall_assessment": {"type": "object"},
+    "cross_problem_analysis": {
+      "type": "object",
+      "required": ["shared_signals", "contrasting_dimensions", "dimension_profiles", "dominant_ecological_dimension", "integrated_interpretation", "uncertainty"]
+    },
+    "measure_recommendations": {"type": "array"},
+    "spatial_evidence": {"type": "object"},
+    "risk_evidence": {"type": "object"},
+    "report_assets": {"type": "object"},
+    "audit": {"type": "object"}
+  },
+  "additionalProperties": false
+}
